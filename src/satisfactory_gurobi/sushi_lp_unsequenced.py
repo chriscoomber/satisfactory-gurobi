@@ -143,8 +143,20 @@ def main() -> None:
         print(f"No optimal solution found (status {model.Status})")
     
     # Now find the optimal ordering of these recipe-scale pairs
-    peak_belt_usage = solve_sequencing(final_scales, item_ids, net_belt, recipes, value)
-    print(f"Overall best value/min = {model.ObjPassNObjVal * 1200/peak_belt_usage:.2f}")
+    peak_belt_usage, recycled_items, sequence = solve_sequencing(final_scales, item_ids, net_belt, recipes, value, log=False)
+    # Need to fit on 1200 belt
+    overall_scale = 1200/peak_belt_usage
+    recycled_items = {i_id: amount * overall_scale for (i_id, amount) in recycled_items.items()}
+    sequence = [(r_id, amount * overall_scale) for (r_id, amount) in sequence]
+
+    print(f"Overall best value/min = {model.ObjPassNObjVal * overall_scale:.2f}")
+    print(f"Items recycled from belt end to start ({len(recycled_items)} items):")
+    for i_id, amt in sorted(recycled_items.items(), key=lambda kv: -kv[1]):
+        print(f"  {i_id}: {amt:.4f}/min")
+    print(f"Peak belt usage: 1200")
+    for i, (r_id, amt) in enumerate(sequence):
+        print(f"  Slot {i + 1}: {r_id} x{amt:.4f})")
+
 
 
 BEAM_WIDTH = 10
@@ -156,7 +168,8 @@ def solve_sequencing(
     net_belt,
     recipes: list[SushiRecipe],
     value: dict[str, float],
-) -> float:
+    log=False
+) -> tuple[float, dict[str, float], dict[str, float]]:
     """
     TODO: This function doesn't appear to work properly, or if it does, the above LP
     optimization produces a poor result for reducing belt load.
@@ -325,15 +338,15 @@ def solve_sequencing(
 
     si_nonzero = {i_id: amt for i_id, amt in starting_inventory.items() if amt > 1e-6}
     if si_nonzero:
-        print(f"Starting inventory needed ({len(si_nonzero)} items):")
+        if log: (f"Starting inventory needed ({len(si_nonzero)} items):")
         for i_id, amt in sorted(si_nonzero.items(), key=lambda kv: -kv[1]):
-            print(f"  {i_id}: {amt:.4f}/min")
-    print(f"Peak belt usage: {peak:.2f}")
+            if log: print(f"  {i_id}: {amt:.4f}/min")
+    if log: print(f"Peak belt usage: {peak:.2f}")
     for s, e in enumerate(best_order):
         r_id, v = final_scales[e]
-        print(f"  Slot {s + 1}: {r_id} x{v:.4f} (belt load: {net_total_at_slot[s + 1]:.2f})")
+        if log: print(f"  Slot {s + 1}: {r_id} x{v:.4f} (belt load: {net_total_at_slot[s + 1]:.2f})")
 
-    return peak
+    return peak, si_nonzero, [final_scales[e] for e in best_order]
 
 
 if __name__ == "__main__":
