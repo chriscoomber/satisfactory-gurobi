@@ -8,9 +8,18 @@ DATA_DIR = Path(__file__).parent.parent.parent / "data"
 
 BELT_CAPACITY = 1200
 
+TOLERANCE = {
+    0.25: 2.76e6,
+    1.0: 0
+}
+
+INGREDIENT_MULT = 0.25
+
+POWER_MULT = 0.25
+
 def main() -> None:
     buildables, items, recipes = parse_game_file(DATA_DIR / "en-GB.json")
-    items, recipes = prepare_recipes_for_sushi(items, recipes, buildables, power_mult=1, ingredient_mult=0.25, include_sloops=False)
+    items, recipes = prepare_recipes_for_sushi(items, recipes, buildables, power_mult=POWER_MULT, ingredient_mult=INGREDIENT_MULT, include_sloops=False)
 
     # Hacky code starts...
     # Remove slooped recipes for now - we can think about slooping later
@@ -57,7 +66,8 @@ def main() -> None:
     model = gp.Model("satisfactory")
 
     # Decision variables: how many of each recipe is run
-    scale = model.addVars(recipe_ids, lb=0.0, ub=10000000.0, name="scale")
+    # Upper bound tries to limit how much of each recipe is created
+    scale = model.addVars(recipe_ids, lb=0.0, ub=(1200/max(1, sum(net_belt(r_id, i_id) for i_id in item_ids)) for r_id in recipe_ids), name="scale")
 
     # Constraints:
     # Initial resources output must be <= 1200
@@ -79,11 +89,28 @@ def main() -> None:
             name=f"otherBalance[{i_id}]"
         )
 
+    # No single recipe should produce over 1200
+
+    model.ModelSense = GRB.MAXIMIZE
     # Objective: maximize total value of items on belt at end
-    model.setObjective(
+    model.setObjectiveN(
         gp.quicksum(value[i_id] * scale[r_id] * net_belt(r_id, i_id) for r_id in recipe_ids for i_id in item_ids),
-        GRB.MAXIMIZE
+        1,
+        priority=2,
+        weight=1,
+        abstol=TOLERANCE[INGREDIENT_MULT], # Manual tuning
+        name="value"
     )
+
+    # Objective: Minimize the total belt load across every recipe
+    model.setObjectiveN(
+        gp.quicksum(scale[r_id] * net_belt(r_id, i_id) for i_id in item_ids for r_id in recipe_ids),
+        2,
+        priority=1,
+        weight=-1,
+        name="beltLoad"
+    )
+
     # model.setObjective(scale["Recipe_SpaceElevatorPart_12_C"], GRB.MAXIMIZE)
 
     model.update()
@@ -92,7 +119,8 @@ def main() -> None:
     model.optimize()
 
     if model.Status == GRB.OPTIMAL:
-        print(f"Optimal value: {model.ObjVal:.2f}")
+        model.params.ObjNumber = 1
+        print(f"Optimal value: {model.ObjPassNObjVal:.2f}")
         final_scales = []
         for r_id in recipe_ids:
             v = scale[r_id].X
@@ -115,7 +143,11 @@ def main() -> None:
         print(f"No optimal solution found (status {model.Status})")
     
     # Now find the optimal ordering of these recipe-scale pairs
-    solve_sequencing(final_scales, item_ids, net_belt, recipes)
+    peak_belt_usage = solve_sequencing(final_scales, item_ids, net_belt, recipes, value)
+    print(f"Overall best value/min = {model.ObjPassNObjVal * 1200/peak_belt_usage:.2f}")
+
+
+BEAM_WIDTH = 10
 
 
 def solve_sequencing(
@@ -123,111 +155,185 @@ def solve_sequencing(
     item_ids: list[str],
     net_belt,
     recipes: list[SushiRecipe],
-) -> None:
+    value: dict[str, float],
+) -> float:
+    """
+    TODO: This function doesn't appear to work properly, or if it does, the above LP
+    optimization produces a poor result for reducing belt load.
+    """
+    # Pre-sort: lowest net value-added recipes first.
+    # Net value = sum over items of (value[item] * net_belt contribution).
+    # Low-value recipes tend to be raw-material producers that need to come early anyway;
+    # this gives the beam search a better starting order to work from.
+    final_scales = sorted(
+        final_scales,
+        key=lambda rv: sum(value.get(i_id, 0.0) * net_belt(rv[0], i_id) for i_id in item_ids),
+    )
+
     n = len(final_scales)
     print(f"Solving a sequencing problem with {n} recipes")
 
-    # Precompute net belt contribution per entry per item (known constants)
     delta = {
         (e, i_id): v * net_belt(r_id, i_id)
         for e, (r_id, v) in enumerate(final_scales)
         for i_id in item_ids
     }
 
-    # Only track items that are actually affected by at least one entry
     active_item_ids = [
         i_id for i_id in item_ids
         if any(abs(delta[e, i_id]) > 1e-9 for e in range(n))
     ]
+    m = len(active_item_ids)
 
-    # Greedy search: at each step pick the feasible entry that minimises peak belt usage
-    belt = {i_id: 0.0 for i_id in active_item_ids}
-    remaining = list(range(n))
-    sequence: list[tuple[str, float]] = []
-    peak = 0.0
-    belt_load_at_slot = [0.0]
+    # 2D list for fast inner-loop access: d[e][k] = net belt contribution of entry e to item k
+    d = [[delta[e, i_id] for i_id in active_item_ids] for e in range(n)]
 
-    # Fix the starting order:
-    starting_order = [
-        "Extract_Desc_Water_C",
-        "Extract_Desc_LiquidOil_C",
-        "Extract_Desc_NitrogenGas_C",
-        "Mine_Desc_OreIron_C",
-        "Mine_Desc_Sulfur_C",
-        "Mine_Desc_OreGold_C",
-        "Mine_Desc_OreCopper_C",
-        "Mine_Desc_SAM_C",
-        "Mine_Desc_RawQuartz_C",
-        "Mine_Desc_OreBauxite_C",
-        "Mine_Desc_Stone_C"
-        ]
-    for e in [r for r in remaining if final_scales[r][0] in starting_order]: 
-        for i_id in active_item_ids:
-            if abs(delta[e, i_id]) > 1e-9:
-                print(f"adding {e} {i_id} {delta[e, i_id]}")
+    def _peak(order: list[int]) -> float:
+        """Exact peak belt usage for a given ordering of entry indices.
+        Peak = sum_i(start[i]) + max_k(net_total[k])
+        where start[i] = max(0, -min_ever_cum[i]) and net_total[k] = sum of cum_belt at step k.
+        """
+        cum = [0.0] * m
+        lo = [0.0] * m   # per-item minimum cumulative (determines starting inventory)
+        max_net = 0.0     # tracks max(net_totals), initialised to net_totals[0] = 0
+        for e in order:
+            net = 0.0
+            for k in range(m):
+                cum[k] += d[e][k]
+                if cum[k] < lo[k]:
+                    lo[k] = cum[k]
+                net += cum[k]
+            if net > max_net:
+                max_net = net
+        S = sum(-v for v in lo if v < 0)
+        return S + max_net
 
-            belt[i_id] += delta[e, i_id]
-        belt_load_at_slot.append(sum(belt.values()))
-        peak = max(peak, sum(belt.values()))
-        sequence.append(final_scales[e])
-        remaining.remove(e)
+    def _score(cum: list, lo: list, neg: list, max_net: float, e: int) -> float:
+        """Estimated final peak if entry e is placed next.
+        Uses worst-case future negatives (all consumers before producers for each item)
+        as a lower bound on final starting inventory.
+        """
+        S = 0.0
+        net = 0.0
+        for k in range(m):
+            tc = cum[k] + d[e][k]
+            tm = lo[k] if lo[k] < tc else tc
+            neg_excl = neg[k] - (d[e][k] if d[e][k] < 0.0 else 0.0)
+            em = tm if tm < tc + neg_excl else tc + neg_excl
+            if em < 0.0:
+                S -= em
+            net += tc
+        return S + (net if net > max_net else max_net)
 
-    # This makes some things go negative. Add them at the start - they are recycled at the end
-    recycled: map[str, float] = {}
-    for (i_id, amount) in belt.items():
-        if amount < 0:
-            belt[i_id] = 0.0
-            recycled[i_id] = -amount
+    def _advance(cum: list, lo: list, neg: list, max_net: float, e: int):
+        """Advance state by placing entry e. Returns (new_cum, new_lo, new_neg, new_max_net)."""
+        nc = [cum[k] + d[e][k] for k in range(m)]
+        nl = [lo[k] if lo[k] < nc[k] else nc[k] for k in range(m)]
+        nn = [neg[k] - (d[e][k] if d[e][k] < 0.0 else 0.0) for k in range(m)]
+        net = sum(nc)
+        return nc, nl, nn, (net if net > max_net else max_net)
 
-    # From experimentation, there's some resources which needs to loop back. The only way this can work is
-    # by going off the end.
-    extra_recycled = {
-        "Desc_FluidCanister_C": 168.0,
-        "Desc_PackagedWater_C": 1114,
-        "Desc_Plastic_C": 10000.0
+    # Fixed starting order for raw resources (placed before beam search begins)
+    starting_order = {
+        "Extract_Desc_Water_C", "Extract_Desc_LiquidOil_C", "Extract_Desc_NitrogenGas_C",
+        "Mine_Desc_OreIron_C", "Mine_Desc_Sulfur_C", "Mine_Desc_OreGold_C",
+        "Mine_Desc_OreCopper_C", "Mine_Desc_SAM_C", "Mine_Desc_RawQuartz_C",
+        "Mine_Desc_OreBauxite_C", "Mine_Desc_Stone_C", "Mine_Desc_Coal_C",
     }
-    for (i_id, amount) in extra_recycled.items():
-        belt[i_id] += amount
-        recycled[i_id] = recycled.get(i_id, 0.0) + amount 
+    prefix = [e for e in range(n) if final_scales[e][0] in starting_order]
+    free   = [e for e in range(n) if final_scales[e][0] not in starting_order]
 
-    # Rewrite belt_load_at_slot to account for recycling
-    total_recycled = sum(recycled.values())
-    belt_load_at_slot = [x + total_recycled for x in belt_load_at_slot]
-    peak += total_recycled
+    cum0  = [0.0] * m
+    lo0   = [0.0] * m
+    neg0  = [sum(d[e][k] for e in range(n) if d[e][k] < 0.0) for k in range(m)]
+    mnet0 = 0.0
+    for e in prefix:
+        cum0, lo0, neg0, mnet0 = _advance(cum0, lo0, neg0, mnet0, e)
 
-    while remaining:
-        best_e = None
-        best_peak = float('inf')
+    # -------------------------------------------------------------------------
+    # Beam search over the free entries
+    # Each beam state: (order, remaining, cum, lo, neg, max_net)
+    # -------------------------------------------------------------------------
+    # State tuple indices
+    _ORD, _REM, _CUM, _LO, _NEG, _MN = 0, 1, 2, 3, 4, 5
 
-        for e in remaining:
-            new_belt = {i_id: belt[i_id] + delta[e, i_id] for i_id in active_item_ids}
-            if any(v < -1e-9 for v in new_belt.values()):
-                problem_items = {(k, new_belt[k]) for k in new_belt if new_belt[k] < -1e-9}
-                print(f"{final_scales[e][0]}: Goes negative {problem_items}")
-                continue  # infeasible placement
-            print(f"Found one!\n")
-            candidate_peak = sum(new_belt.values())
-            if candidate_peak < best_peak:
-                best_peak = candidate_peak
-                best_e = e
+    beam: list[tuple] = [(prefix[:], free[:], cum0, lo0, neg0, mnet0)]
 
-        if best_e is None:            
-            print(f"No feasible placement found at step {len(sequence) + 1} — no valid ordering exists.")
-            print(f"\n{sequence}\n\n{belt}\n\n{[final_scales[e][0] for e in remaining]}")
-            return
+    while beam[0][_REM]:
+        candidates: list[tuple] = []
+        for bi, state in enumerate(beam):
+            cum, lo, neg, max_net = state[_CUM], state[_LO], state[_NEG], state[_MN]
+            for e in state[_REM]:
+                sc = _score(cum, lo, neg, max_net, e)
+                candidates.append((sc, bi, e, state))
 
-        for i_id in active_item_ids:
-            belt[i_id] += delta[best_e, i_id]
-        belt_load_at_slot.append(sum(belt.values()))
-        peak = max(peak, sum(belt.values()))
-        sequence.append(final_scales[best_e])
-        remaining.remove(best_e)
+        candidates.sort(key=lambda x: (x[0], x[1], x[2]))
 
-    print(f"Starting belt load from recycled goods: {belt_load_at_slot[0]:.2f}")
+        new_beam: list[tuple] = []
+        for sc, bi, e, state in candidates:
+            if len(new_beam) >= BEAM_WIDTH:
+                break
+            nc, nl, nn, nm = _advance(state[_CUM], state[_LO], state[_NEG], state[_MN], e)
+            new_beam.append((
+                state[_ORD] + [e],
+                [x for x in state[_REM] if x != e],
+                nc, nl, nn, nm,
+            ))
+        beam = new_beam
+
+    best_order: list[int] = min((s[_ORD] for s in beam), key=_peak)
+    print(f"Beam search peak: {_peak(best_order):.2f}. Running 2-opt local search...")
+
+    # -------------------------------------------------------------------------
+    # 2-opt local search: try all pairwise swaps within the free portion only.
+    # The prefix (starting_order entries) stays fixed at the front.
+    # -------------------------------------------------------------------------
+    free_start = len(prefix)
+    current_peak = _peak(best_order)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(free_start, len(best_order)):
+            for j in range(i + 1, len(best_order)):
+                best_order[i], best_order[j] = best_order[j], best_order[i]
+                p = _peak(best_order)
+                if p < current_peak - 1e-6:
+                    current_peak = p
+                    improved = True
+                else:
+                    best_order[i], best_order[j] = best_order[j], best_order[i]
+            if improved:
+                break  # restart the outer loop
+
+    # -------------------------------------------------------------------------
+    # Report results
+    # -------------------------------------------------------------------------
+    cum = [0.0] * m
+    lo  = [0.0] * m
+    net_totals = [0.0]
+    for e in best_order:
+        for k in range(m):
+            cum[k] += d[e][k]
+            if cum[k] < lo[k]:
+                lo[k] = cum[k]
+        net_totals.append(sum(cum))
+
+    starting_inventory = {active_item_ids[k]: max(0.0, -lo[k]) for k in range(m)}
+    S = sum(starting_inventory.values())
+    peak = S + max(net_totals)
+    net_total_at_slot = [S + t for t in net_totals]
+
+    si_nonzero = {i_id: amt for i_id, amt in starting_inventory.items() if amt > 1e-6}
+    if si_nonzero:
+        print(f"Starting inventory needed ({len(si_nonzero)} items):")
+        for i_id, amt in sorted(si_nonzero.items(), key=lambda kv: -kv[1]):
+            print(f"  {i_id}: {amt:.4f}/min")
     print(f"Peak belt usage: {peak:.2f}")
-    for s, (r_id, v) in enumerate(sequence):
-        print(f"  Slot {s + 1}: {r_id} x{v:.4f} (Belt load: {belt_load_at_slot[s+1]:.2f})")
+    for s, e in enumerate(best_order):
+        r_id, v = final_scales[e]
+        print(f"  Slot {s + 1}: {r_id} x{v:.4f} (belt load: {net_total_at_slot[s + 1]:.2f})")
 
+    return peak
 
 
 if __name__ == "__main__":
